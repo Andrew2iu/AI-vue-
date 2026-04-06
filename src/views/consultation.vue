@@ -266,7 +266,7 @@
                         clearable
                     />
                     <div class="input-footer">
-                        <span>>按Enter发送,Shift+Enter换行</span>
+                        <span>按Enter发送,Shift+Enter换行</span>
                         <span>{{ userMessage.length }}/500</span>
                     </div>
                 </div>
@@ -285,7 +285,7 @@
     </div>
 </template>
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, onMounted, computed } from "vue";
 import {
     startSession,
     getSessionList,
@@ -305,7 +305,82 @@ const messages = ref([]);
 const userMessage = ref("");
 const isAiTyping = ref(false);
 
-const handleKeyDown = (e) => {};
+// 防抖节流函数
+const debounce = (func, delay) => {
+    let timeoutId;
+    return (...args) => {
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => func.apply(null, args), delay);
+    };
+};
+
+// 数据缓存
+const sessionCache = ref(new Map());
+const emotionCache = ref(new Map());
+
+// 缓存键生成函数
+const generateCacheKey = (prefix, id) => {
+    return `${prefix}_${id}`;
+};
+
+// 缓存会话数据
+const cacheSessionData = (sessionId, data) => {
+    const key = generateCacheKey("session", sessionId);
+    sessionCache.value.set(key, {
+        data,
+        timestamp: Date.now(),
+    });
+    // 限制缓存大小
+    if (sessionCache.value.size > 10) {
+        const oldestKey = sessionCache.value.keys().next().value;
+        sessionCache.value.delete(oldestKey);
+    }
+};
+
+// 缓存情绪数据
+const cacheEmotionData = (sessionId, data) => {
+    const key = generateCacheKey("emotion", sessionId);
+    emotionCache.value.set(key, {
+        data,
+        timestamp: Date.now(),
+    });
+};
+
+// 从缓存获取会话数据
+const getCachedSessionData = (sessionId) => {
+    const key = generateCacheKey("session", sessionId);
+    const cached = sessionCache.value.get(key);
+    if (cached) {
+        // 检查缓存是否过期（5分钟）
+        if (Date.now() - cached.timestamp < 5 * 60 * 1000) {
+            return cached.data;
+        } else {
+            sessionCache.value.delete(key);
+        }
+    }
+    return null;
+};
+
+// 从缓存获取情绪数据
+const getCachedEmotionData = (sessionId) => {
+    const key = generateCacheKey("emotion", sessionId);
+    const cached = emotionCache.value.get(key);
+    if (cached) {
+        // 检查缓存是否过期（5分钟）
+        if (Date.now() - cached.timestamp < 5 * 60 * 1000) {
+            return cached.data;
+        } else {
+            emotionCache.value.delete(key);
+        }
+    }
+    return null;
+};
+
+const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+        sendMessage();
+    }
+};
 
 // 情绪花园
 const currentEmotion = ref({
@@ -317,14 +392,29 @@ const currentEmotion = ref({
     improvementSuggestions: [],
 });
 
-const loadSessionEmotion = (sessionId) => {
+// 防抖处理的情绪分析
+const loadSessionEmotion = debounce((sessionId) => {
     const id = sessionId.toString().startsWith("session_")
         ? sessionId
         : `session_${sessionId}`;
-    getSessionEmotion(id).then((res) => {
-        currentEmotion.value = res;
-    });
-};
+
+    // 先检查缓存
+    const cachedEmotion = getCachedEmotionData(id);
+    if (cachedEmotion) {
+        currentEmotion.value = cachedEmotion;
+        return;
+    }
+
+    getSessionEmotion(id)
+        .then((res) => {
+            currentEmotion.value = res;
+            // 缓存情绪数据
+            cacheEmotionData(id, res);
+        })
+        .catch((error) => {
+            console.error("获取情绪数据失败:", error);
+        });
+}, 300);
 
 const getIntensityClass = (score) => {
     if (score >= 61) {
@@ -350,6 +440,9 @@ const getRiskText = (level) => {
     }
 };
 
+// 当前对话对象
+const currentSession = ref(null);
+
 // 新建会话
 const createNewFrontndSession = () => {
     // 创建一个新的会话对象
@@ -359,10 +452,9 @@ const createNewFrontndSession = () => {
         sessionTitle: "新会话",
     };
     currentSession.value = newSession;
+    // 清空消息列表，准备新会话
+    messages.value = [];
 };
-
-// 当前对话对象
-const currentSession = ref(null);
 
 // 列表数据
 const sessionList = ref([]);
@@ -374,6 +466,11 @@ const sendMessage = () => {
     }
     const message = userMessage.value.trim();
     userMessage.value = "";
+
+    if (!currentSession.value) {
+        // 如果当前没有会话，创建一个新的临时会话
+        createNewFrontndSession();
+    }
 
     if (currentSession.value.status === "TEMP") {
         startNewSession(message);
@@ -393,7 +490,7 @@ const startNewSession = (message) => {
     const sessionParams = {
         initialMessage: message,
     };
-    if (currentSession.value.sessionTitle === "新对话") {
+    if (currentSession.value.sessionTitle === "新会话") {
         sessionParams.sessionTitle = `AI助手-${new Date().toLocaleString()}`;
     } else {
         sessionParams.sessionTitle = currentSession.value.sessionTitle;
@@ -437,6 +534,7 @@ const startAIResponse = (sessionId, userMessage) => {
     };
     messages.value.push(aiMessage);
     const ctrl = new AbortController();
+
     // 调用流式接口
     fetchEventSource("/api/psychological-chat/stream", {
         method: "POST",
@@ -448,12 +546,21 @@ const startAIResponse = (sessionId, userMessage) => {
         body: JSON.stringify({
             sessionId,
             userMessage,
+            // 传递当前情绪状态，帮助AI生成更符合用户情绪的回复
+            currentEmotion: currentEmotion.value.primaryEmotion,
         }),
         signal: ctrl.signal,
         onopen: (response) => {
-            console.log(response);
+            if (!response.ok) {
+                handleError(`服务器返回错误: ${response.status}`);
+                ctrl.abort();
+                return;
+            }
+
             if (response.headers.get("Content-Type") !== "text/event-stream") {
-                ElMessage.error("服务器返回非流式数据");
+                handleError("服务器返回非流式数据");
+                ctrl.abort();
+                return;
             }
         },
         onmessage: (event) => {
@@ -461,30 +568,48 @@ const startAIResponse = (sessionId, userMessage) => {
             if (!raw) {
                 return;
             }
+
             const eventName = event.event;
             const aiMessage = messages.value[messages.value.length - 1];
+
             if (eventName === "done") {
                 isAiTyping.value = false;
                 ctrl.abort();
+                // 防抖处理情绪分析
                 loadSessionEmotion(currentSession.value.sessionId);
                 return;
             }
-            const payload = JSON.parse(raw);
-            const ok = String(payload.code) === "200";
-            if (ok && payload.data && payload.data.content) {
-                aiMessage.content += payload.data.content;
-            } else if (ok) {
-                // 错误回复
-                handleError(payload.message || "AI回复失败");
+
+            try {
+                const payload = JSON.parse(raw);
+                const ok = String(payload.code) === "200";
+
+                if (ok && payload.data && payload.data.content) {
+                    // 实时更新AI回复内容，提升用户体验
+                    aiMessage.content += payload.data.content;
+                } else if (ok && payload.data && payload.data.emotion) {
+                    // 实时更新情绪状态
+                    currentEmotion.value = {
+                        ...currentEmotion.value,
+                        ...payload.data.emotion,
+                    };
+                } else if (!ok) {
+                    // 错误回复
+                    handleError(payload.message || "AI回复失败");
+                }
+            } catch (error) {
+                console.error("解析AI回复失败:", error);
+                // 继续处理，避免整个流程中断
             }
         },
         onerror: (err) => {
-            handleError(err || "AI回复失败");
-            throw err;
+            console.error("AI流式接口错误:", err);
+            handleError(err.message || "AI回复失败");
+            // 不抛出错误，避免控制台报错
         },
         onclose: () => {
-            // 开始情绪分析
-            loadSessionEmotion(currentSession.value.sessionId);
+            // 确保状态重置
+            isAiTyping.value = false;
         },
     });
 };
@@ -517,12 +642,28 @@ const handleDeleteSession = (sessionId) => {
 };
 // 点击会话
 const handleSessionClick = (session) => {
-    getSessionDetail(session.id).then((res) => {
-        messages.value = res;
-    });
-    loadSessionEmotion(session.id);
+    const sessionId = "session_" + session.id;
+
+    // 先检查缓存
+    const cachedSession = getCachedSessionData(sessionId);
+    if (cachedSession) {
+        messages.value = cachedSession;
+    } else {
+        getSessionDetail(session.id)
+            .then((res) => {
+                messages.value = res;
+                // 缓存会话数据
+                cacheSessionData(sessionId, res);
+            })
+            .catch((error) => {
+                console.error("获取会话详情失败:", error);
+                ElMessage.error("获取会话详情失败，请稍后再试");
+            });
+    }
+
+    loadSessionEmotion(sessionId);
     const sessionData = {
-        sessionId: "session_" + session.id,
+        sessionId: sessionId,
         status: "ACTIVE",
         sessionTitle: session.sessionTitle,
     };
